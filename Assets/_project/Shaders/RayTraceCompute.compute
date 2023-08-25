@@ -1,0 +1,557 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+TextureCube<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4 _DirectionalLight;
+float _Seed;
+float2 _Pixel;
+
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<int> _Indices;
+
+#define INFINITY 1.#INF
+#define PI 3.1415926535897932385
+#define AA_SAMPLES 10
+#define MAX_BOUNCES 10
+
+// Utility Functions
+
+#define RANDOM_IA 16807
+#define RANDOM_IM 2147483647
+#define RANDOM_AM (1.0f/float(RANDOM_IM))
+#define RANDOM_IQ 127773u
+#define RANDOM_IR 2836
+#define RANDOM_MASK 123459876
+
+float energy(float3 color)
+{
+    return dot(color, 1.0f / 3.0f);
+}
+
+
+float SmoothnessToPhongAlpha(float s)
+{
+    return pow(1000.0f, s * s);
+}
+
+float sdot(float3 x, float3 y, float f = 1.0f)
+{
+    return saturate(dot(x, y) * f);
+}
+
+float DegreesToRadians(float degrees)
+{
+    return degrees * PI / 180.0;
+}
+
+float LengthSquared(float3 value)
+{
+    return dot(value, value);
+}
+
+float3x3 GetTangentSpace(float3 normal)
+{
+    // Choose a helper vector for the cross product
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > 0.99f)
+        helper = float3(0, 0, 1);
+    // Generate vectors
+    float3 tangent = normalize(cross(normal, helper));
+    float3 binormal = normalize(cross(normal, tangent));
+    return float3x3(tangent, binormal, normal);
+}
+
+float rand()
+{
+    float result = frac(sin(_Seed / 100.0f * dot(_Pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+float3 SampleHemisphere(float3 normal, float alpha)
+{
+    // Sample the hemisphere, where alpha determines the kind of the sampling
+    float cosTheta = pow(rand(), 1.0f / (alpha + 1.0f));
+    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+    float phi = 2 * PI * rand();
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    // Transform direction to world space
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+struct NumberGenerator
+{
+    int seed; // Used to generate values.
+    
+    // Generates the next number in the sequence.
+    void Cycle()
+    {
+        seed ^= RANDOM_MASK;
+        int k = seed / RANDOM_IQ;
+        seed = RANDOM_IA * (seed - k * RANDOM_IQ) - RANDOM_IR * k;
+
+        if (seed < 0) 
+            seed += RANDOM_IM;
+
+        seed ^= RANDOM_MASK;
+    }
+    
+    // Returns the current random float.
+    float GetCurrentFloat()
+    {
+        Cycle();
+        return RANDOM_AM * seed;
+    }
+
+    // Returns the current random int.
+    int GetCurrentInt()
+    {
+        Cycle();
+        return seed;
+    }
+    
+    // Cycles the generator based on the input count. Useful for generating a thread unique seed.
+    // PERFORMANCE - O(N)
+    void Cycle(uint _count)
+    {
+        for (uint i = 0; i < _count; ++i)
+            Cycle();
+    }
+
+    // Returns a random float within the input range.
+    float GetRandomFloat(float low, float high)
+    {
+        float v = GetCurrentFloat();
+        return low * (1.0f - v) + high * v;
+    }
+    
+    float3 GetRandomFloat3(float low, float high)
+    {
+        return float3(GetRandomFloat(low, high), GetRandomFloat(low, high), GetRandomFloat(low, high));
+    }
+    
+    float3 GetRandomUnitSphere()
+    {
+        int maxTests = 1000;
+        for (int i = 0; i < maxTests; i++)
+        {
+            float3 p = GetRandomFloat3(-1, 1);
+            
+            if (LengthSquared(p) < 1.0)
+            {
+                return p;
+            }
+        }
+        
+        return float3(0.0, 0.0, 0.0);
+    }
+    
+    float3 GetRandomUnitNormalized()
+    {
+        return normalize(GetRandomUnitSphere());
+    }
+    
+    float3 GetRandomOnHemisphere(float3 normal)
+    {
+        float3 onUnitSphere = GetRandomUnitNormalized();
+        
+        if (dot(onUnitSphere, normal) > 0.0)
+        {
+            return onUnitSphere;
+        }
+        else
+        {
+            return -onUnitSphere;
+        }
+    }
+    
+    float3 SampleHemisphere(float3 normal, float alpha)
+    {
+    // Sample the hemisphere, where alpha determines the kind of the sampling
+        float cosTheta = pow(rand(), 1.0f / (alpha + 1.0f));
+        float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+        float phi = 2 * PI * rand();
+        float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    // Transform direction to world space
+        return mul(tangentSpaceDir, GetTangentSpace(normal));
+    }
+
+    // Sets the seed
+    void SetSeed(const uint value)
+    {
+        seed = int(value);
+        Cycle();
+    }
+};
+
+class Interval
+{
+    float min;
+    float max;
+    
+    bool contains(float x)
+    {
+        return min <= x && x <= max;
+    }
+    
+    bool surrounds(float x)
+    {
+        return min < x && x < max;
+    }
+    
+    float clamp(float x)
+    {
+        if (x < min)
+            return min;
+        if (x > max)
+            return max;
+
+        return x;
+    }
+};
+
+Interval CreateInterval(float min, float max)
+{
+    Interval interval;
+    interval.min = min;
+    interval.max = max;
+    
+    return interval;
+}
+
+Interval GetEmptyInterval()
+{
+    return CreateInterval(INFINITY, -INFINITY);
+}
+
+Interval GetUniverseInterval()
+{
+    return CreateInterval(-INFINITY, INFINITY);
+}
+
+class Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+    
+    float3 at(float t)
+    {
+        return origin + t * direction;
+    }
+};
+
+
+class HitResult
+{
+    float3 p;
+    float3 normal;
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+    float t;
+    bool frontFace;
+    
+    void setFaceNormal(Ray ray, float3 outwardNormal)
+    {
+        frontFace = dot(ray.direction, outwardNormal) < 0;
+        normal = frontFace ? outwardNormal : -outwardNormal;
+    }
+};
+
+class MeshObject
+{
+    float4x4 localToWorldMatrix;
+    int indices_offset;
+    int indices_count;
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+    
+    static const float EPSILON = 1e-8;
+    bool IntersectTriangle_MT97(Ray ray, float3 vert0, float3 vert1, float3 vert2,
+    inout float t, inout float u, inout float v)
+    {
+        float3 edge1 = vert1 - vert0;
+        float3 edge2 = vert2 - vert0;
+        
+        float3 pvec = cross(ray.direction, edge2);
+        
+        float det = dot(edge1, pvec);
+        
+        if (det < EPSILON)
+            return false;
+        float inv_det = 1.0f / det;
+        
+        float3 tvec = ray.origin - vert0;
+        
+        u = dot(tvec, pvec) * inv_det;
+        if (u < 0.0 || u > 1.0f)
+            return false;
+        
+        float3 qvec = cross(tvec, edge1);
+        
+        v = dot(ray.direction, qvec) * inv_det;
+        if (v < 0.0 || u + v > 1.0f)
+            return false;
+        
+        t = dot(edge2, qvec) * inv_det;
+        return true;
+    }
+
+    bool Hit(Ray ray, Interval interval, inout HitResult hitResult)
+    {
+        uint offset = indices_offset;
+        uint count = offset + indices_count;
+        for (uint i = offset; i < count; i += 3)
+        {
+            float3 v0 = (mul(localToWorldMatrix, float4(_Vertices[_Indices[i]], 1))).xyz;
+            float3 v1 = (mul(localToWorldMatrix, float4(_Vertices[_Indices[i + 1]], 1))).xyz;
+            float3 v2 = (mul(localToWorldMatrix, float4(_Vertices[_Indices[i + 2]], 1))).xyz;
+            float t, u, v;
+            if (IntersectTriangle_MT97(ray, v0, v1, v2, t, u, v))
+            {
+                if (interval.contains(t))
+                {
+                    hitResult.t = t;
+                    hitResult.p = ray.at(hitResult.t);
+                    hitResult.normal = normalize(cross(v1 - v0, v2 - v0));
+                    hitResult.albedo = albedo;
+                    hitResult.specular = specular;
+                    hitResult.smoothness = smoothness;
+                    hitResult.emission = emission;
+                    return true;
+                }
+                
+                return false;
+                
+            /*if (t > 0 && t < bestHit.distance)
+            {
+                bestHit.distance = t;
+            }*/
+            }
+        }
+        
+        return false;
+    }
+};
+StructuredBuffer<MeshObject> _MeshObjects;
+
+
+class Sphere
+{
+    float3 center;
+    float radius;
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+    
+    bool Hit(Ray ray, Interval interval, inout HitResult hitResult)
+    {
+        float3 oc = ray.origin - center;
+        float a = LengthSquared(ray.direction);
+        float half_b = dot(oc, ray.direction);
+        float c = LengthSquared(oc) - radius * radius;
+
+        float discriminant = half_b * half_b - a * c;
+        if (discriminant < 0)
+            return false;
+        float sqrtd = sqrt(discriminant);
+        
+        // Find the nearest root that lies in the acceptable range.
+        float root = (-half_b - sqrtd) / a;
+        if (!interval.surrounds(root))
+        {
+            root = (-half_b + sqrtd) / a;
+            if (!interval.surrounds(root))
+            {
+                return false;
+            }
+        }
+
+        hitResult.t = root;
+        hitResult.p = ray.at(hitResult.t);
+        float3 outwardNormal = (hitResult.p - center) / radius;
+        hitResult.setFaceNormal(ray, outwardNormal);
+        hitResult.albedo = albedo;
+        hitResult.specular = specular;
+        hitResult.smoothness = smoothness;
+        hitResult.emission = emission;
+
+        return true;
+    }
+};
+
+Sphere CreateSphere(float3 center, float radius)
+{
+    Sphere s;
+    s.center = center;
+    s.radius = radius;
+    return s;
+}
+
+StructuredBuffer<Sphere> _Spheres;
+
+class World
+{
+    bool Hit(Ray ray, Interval interval, out HitResult hitResult)
+    {
+        uint count, stride;
+        _Spheres.GetDimensions(count, stride);
+        
+        bool hitAnything = false;
+        HitResult tmpHitResult;
+        float closest = interval.max;
+
+        for (int i = 0; i < count; i++)
+        {
+            Sphere sphere = _Spheres[i];
+            if (sphere.Hit(ray, CreateInterval(interval.min, closest), tmpHitResult))
+            {
+                hitAnything = true;
+                closest = tmpHitResult.t;
+                hitResult = tmpHitResult;
+            }
+        }
+        
+        _MeshObjects.GetDimensions(count, stride);
+        for (int j = 0; j < count; j++)
+        {
+            MeshObject meshObject = _MeshObjects[j];
+            if (meshObject.Hit(ray, CreateInterval(interval.min, closest), tmpHitResult))
+            {
+                if (tmpHitResult.t < closest)
+                {
+                    hitAnything = true;
+                    closest = tmpHitResult.t;
+                    hitResult = tmpHitResult;
+                }
+            }
+        }
+        
+        return hitAnything;
+    }
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0, 1.0, 1.0);
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+
+float3 Shade(inout Ray ray, bool didHit, HitResult hit, World world, NumberGenerator gen)
+{
+    if (didHit)
+    {
+        
+        // Reflect the ray and multiply energy with specular reflection
+        ray.origin = hit.p + hit.normal * 0.001;
+        ray.direction = reflect(ray.direction, hit.normal);
+        ray.energy *= hit.specular;
+
+        // Shadow test ray
+        bool shadow = false;
+        Ray shadowRay = CreateRay(hit.p + hit.normal * 0.001f, -1 * _DirectionalLight.xyz);
+        
+        HitResult shadowRes;
+        bool shadowHit = world.Hit(shadowRay, CreateInterval(0, INFINITY), shadowRes);
+        if (shadowHit)
+        {
+            return float3(0.0f, 0.0f, 0.0f);
+        }
+        
+        return saturate(dot(hit.normal, _DirectionalLight.xyz) * -1) * _DirectionalLight.w * hit.albedo;
+    }
+    else
+    {
+        ray.energy = 0.0;
+        
+        float theta = acos(ray.direction.y) / -PI;
+        float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5;
+        return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, normalize(ray.direction), 0).rgb;
+    }
+}
+
+
+float3 RayColor(Ray ray, World world, NumberGenerator gen)
+{
+    float3 result = float3(0.0, 0.0, 0.0);
+    float fraction = 0.1;
+    
+    for (int i = 0; i < MAX_BOUNCES; i++)
+    {
+        HitResult hitResult;
+        bool hit = world.Hit(ray, CreateInterval(0, INFINITY), hitResult);
+        
+        result += ray.energy * Shade(ray, hit, hitResult, world, gen);
+                
+        if (!any(ray.energy))
+            break;
+    }
+    
+    
+    return result;
+
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    _Pixel = id.xy;
+
+    World world;
+    
+    float3 color = float3(0, 0, 0);
+    NumberGenerator gen;
+    gen.SetSeed(int(_Seed) + (id.x + 1) * (id.y + 1));
+    
+    for (int i = 0; i < AA_SAMPLES; i++)
+    {
+        float2 idf = float2(id.xy);
+        idf.x += gen.GetRandomFloat(0.0, 0.9999);
+        idf.y += gen.GetRandomFloat(0.0, 0.9999);
+        float2 uv = float2((idf.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+        
+        Ray ray = CreateCameraRay(uv);
+        
+        color += RayColor(ray, world, gen);
+    }
+    
+    float scale = 1.0 / AA_SAMPLES;
+    color.r *= scale;
+    color.g *= scale;
+    color.b *= scale;
+
+    // Write some colors
+    Result[id.xy] = float4(color.r, color.g, color.b, 1.0f);
+}
