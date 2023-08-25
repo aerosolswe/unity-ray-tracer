@@ -4,8 +4,7 @@ This is a very bad and unoptimized ray tracer in Unity. I was experimenting with
 
 To make this ray tracer I followed the famous "Ray Tracing in One Weekend"  and "GPU Ray Tracing in Unity"
 
-https://youtu.be/hTA5dRt1Cgo
-[![](https://youtu.be/hTA5dRt1Cgo)](https://youtu.be/hTA5dRt1Cgo)
+[![Video](https://markdown-videos-api.jorgenkh.no/url?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DhTA5dRt1Cgo)](https://www.youtube.com/watch?v=hTA5dRt1Cgo)
 
 Links: 
 https://raytracing.github.io/
